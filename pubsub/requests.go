@@ -13,7 +13,8 @@ type PublishRequest struct {
 
 // SubscribeRequest is the request to subscribe to a topic
 type SubscribeRequest struct {
-	Topic string `json:"topic"`
+	Topic                 string `json:"topic"`
+	MaxConcurrentMessages int    `json:"maxconcurrentmessages"`
 }
 
 // NewMessage is an event arriving from a message bus instance

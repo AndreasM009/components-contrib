@@ -32,6 +32,11 @@ type redisStreams struct {
 	logger logger.Logger
 }
 
+type redisMessage struct {
+	message    *pubsub.NewMessage
+	xmessageID string
+}
+
 // NewRedisStreams returns a new redis streams pub-sub implementation
 func NewRedisStreams(logger logger.Logger) pubsub.PubSub {
 	return &redisStreams{logger: logger}
@@ -116,7 +121,7 @@ func (r *redisStreams) Subscribe(req pubsub.SubscribeRequest, handler func(msg *
 	if err != nil {
 		r.logger.Warnf("redis streams: %s", err)
 	}
-	go r.beginReadingFromStream(req.Topic, r.metadata.consumerID, handler)
+	go r.beginReadingFromStream(req.Topic, r.metadata.consumerID, req.MaxConcurrentMessages, handler)
 	return nil
 }
 
@@ -132,6 +137,80 @@ func (r *redisStreams) readFromStream(stream, consumerID, start string) ([]redis
 	}
 
 	return res, nil
+}
+
+func (r *redisStreams) beginReadingFromStream(stream, consumerID string, maxConcurrentMessages int, handler func(msg *pubsub.NewMessage) error) {
+	if maxConcurrentMessages <= 0 {
+		r.beginReadAndProcessStreams(stream, consumerID, handler)
+	} else {
+		r.logger.Infof("redis streams: using max concurrent messages: %d", maxConcurrentMessages)
+		r.beginReadAndEnqueueStreams(stream, consumerID, maxConcurrentMessages, handler)
+	}
+}
+
+func (r *redisStreams) beginReadAndProcessStreams(stream, consumerID string, handler func(msg *pubsub.NewMessage) error) {
+	// first read pending items in case of recovering from crash
+	start := "0"
+
+	for {
+		streams, err := r.readFromStream(stream, consumerID, start)
+		if err != nil {
+			r.logger.Errorf("redis streams: error reading from stream %s: %s", stream, err)
+			return
+		}
+
+		r.processStreams(consumerID, streams, handler)
+
+		//continue with new non received items
+		start = ">"
+	}
+}
+
+func (r *redisStreams) beginReadAndEnqueueStreams(stream, consumerID string, maxConcurrentMessages int, handler func(msg *pubsub.NewMessage) error) {
+	// first read pending items in case of recovering from crash
+	start := "0"
+
+	msginput := make(chan *redisMessage, maxConcurrentMessages*2)
+	defer close(msginput)
+
+	// start max concurrent Handlers
+	for i := 0; i < maxConcurrentMessages; i++ {
+		go r.processDequeueMessages(stream, consumerID, handler, msginput)
+	}
+
+	for {
+		streams, err := r.readFromStream(stream, consumerID, start)
+		if err != nil {
+			r.logger.Errorf("redis streams: error reading from stream %s: %s", stream, err)
+			return
+		}
+
+		r.enqueueStreams(consumerID, streams, msginput)
+
+		//continue with new non received items
+		start = ">"
+	}
+}
+
+func (r *redisStreams) enqueueStreams(consumerID string, streams []redis.XStream, messages chan<- *redisMessage) {
+	for _, s := range streams {
+		for _, m := range s.Messages {
+			newmessage := &pubsub.NewMessage{
+				Topic: s.Stream,
+			}
+			data, exists := m.Values["data"]
+			if exists && data != nil {
+				newmessage.Data = []byte(data.(string))
+			}
+
+			msg := &redisMessage{
+				message:    newmessage,
+				xmessageID: m.ID,
+			}
+
+			messages <- msg
+		}
+	}
 }
 
 func (r *redisStreams) processStreams(consumerID string, streams []redis.XStream, handler func(msg *pubsub.NewMessage) error) {
@@ -155,19 +234,17 @@ func (r *redisStreams) processStreams(consumerID string, streams []redis.XStream
 	}
 }
 
-func (r *redisStreams) beginReadingFromStream(stream, consumerID string, handler func(msg *pubsub.NewMessage) error) {
-	// first read pending items in case of recovering from crash
-	start := "0"
-
+func (r *redisStreams) processDequeueMessages(stream string, consumerID string, handler func(msg *pubsub.NewMessage) error, messages <-chan *redisMessage) {
 	for {
-		streams, err := r.readFromStream(stream, consumerID, start)
-		if err != nil {
-			r.logger.Errorf("redis streams: error reading from stream %s: %s", stream, err)
+		m := <-messages
+
+		if nil == m {
 			return
 		}
-		r.processStreams(consumerID, streams, handler)
 
-		//continue with new non received items
-		start = ">"
+		err := handler(m.message)
+		if err == nil {
+			r.client.XAck(stream, consumerID, m.xmessageID)
+		}
 	}
 }

@@ -82,6 +82,33 @@ func TestParseRedisMetadata(t *testing.T) {
 	})
 }
 
+func TestEnqueueStreams(t *testing.T) {
+	fakeConsumerID := "fakeConsumer"
+	messageCount := 0
+	expectedData := "testData"
+
+	fakeHandler := func(msg *pubsub.NewMessage) error {
+		messageCount++
+		assert.Equal(t, expectedData, string(msg.Data))
+
+		return errors.New("fake error")
+	}
+
+	// act
+	testRedisStream := &redisStreams{logger: logger.NewLogger("test")}
+	msginput := make(chan *redisMessage, 5)
+
+	for i := 0; i < 5; i++ {
+		go testRedisStream.processDequeueMessages(fakeConsumerID, fakeConsumerID, fakeHandler, msginput)
+	}
+
+	testRedisStream.enqueueStreams(fakeConsumerID, generateRedisStreamTestData(1, 10, expectedData), msginput)
+
+	time.Sleep(time.Millisecond * 500)
+	close(msginput)
+	assert.Equal(t, 10, messageCount)
+}
+
 func TestProcessStreams(t *testing.T) {
 	fakeConsumerID := "fakeConsumer"
 	topicCount := 0
